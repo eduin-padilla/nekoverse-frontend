@@ -2,13 +2,17 @@ import { create } from 'zustand'
 
 interface Session {
   id: number
-  token: string
+  credentialId: string
 }
 
 interface SessionState {
   session: Session | null
+  generation: number
+  restoring: boolean
   logoutSessionId: number | null
-  startSession: (token: string) => Session
+  startSession: (credentialId: string) => Session
+  restoreSession: () => void
+  confirmSession: (generation: number, credentialId: string) => void
   clearSession: (sessionId: number) => boolean
   beginLogout: (sessionId: number) => boolean
   finishLogout: (sessionId: number) => void
@@ -19,15 +23,24 @@ let pendingLogin: AbortController | undefined
 
 export const useSessionStore = create<SessionState>((set, get) => ({
   session: null,
+  generation: 0,
+  restoring: true,
   logoutSessionId: null,
-  startSession: token => {
-    const session = { id: ++nextSessionId, token }
-    set({ session })
+  startSession: credentialId => {
+    const session = { id: ++nextSessionId, credentialId }
+    set({ session, generation: session.id, restoring: false })
     return session
   },
+  restoreSession: () => set({ session: null, generation: ++nextSessionId, restoring: true }),
+  confirmSession: (generation, credentialId) => {
+    const current = get()
+    if (current.generation === generation && current.restoring) {
+      set({ session: { id: generation, credentialId }, restoring: false })
+    }
+  },
   clearSession: sessionId => {
-    if (get().session?.id !== sessionId) return false
-    set({ session: null })
+    if (get().generation !== sessionId) return false
+    set({ session: null, generation: ++nextSessionId, restoring: false })
     return true
   },
   beginLogout: sessionId => {

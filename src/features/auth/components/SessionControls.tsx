@@ -11,11 +11,12 @@ const focusClass = 'focus-visible:outline-2 focus-visible:outline-offset-2 focus
 const guestClass = `inline-flex min-h-11 items-center rounded-lg px-2.5 font-medium whitespace-nowrap aria-[current=page]:ring-2 aria-[current=page]:ring-violet-200 ${focusClass}`
 const menuItemClass = `flex min-h-11 w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm text-slate-100 hover:bg-violet-400/15 aria-[current=page]:bg-violet-400/15 aria-[current=page]:text-violet-100 ${focusClass}`
 
-function AccountMenu({ profile, profileRoute, isLoggingOut, onLogout }: {
+function AccountMenu({ profile, profileRoute, isLoggingOut, onLogout, onLocalLogout }: {
   profile?: UserProfile
   profileRoute: boolean
   isLoggingOut: boolean
   onLogout: () => void
+  onLocalLogout: () => void
 }) {
   const [open, setOpen] = useState(false)
   const [failedAvatar, setFailedAvatar] = useState<string>()
@@ -69,6 +70,9 @@ function AccountMenu({ profile, profileRoute, isLoggingOut, onLogout }: {
           <LogOut size={16} aria-hidden="true" className="shrink-0 text-violet-300" />
           {isLoggingOut ? 'Cerrando sesión…' : 'Cerrar sesión en todos los dispositivos'}
         </button>
+        <button type="button" className={`${menuItemClass} disabled:opacity-60`} disabled={isLoggingOut} onClick={onLocalLogout}>
+          Cerrar sesión en este navegador
+        </button>
       </div>
     </div>
   )
@@ -76,10 +80,18 @@ function AccountMenu({ profile, profileRoute, isLoggingOut, onLogout }: {
 
 export function SessionControls() {
   const sessionId = useSessionStore(state => state.session?.id)
+  const restoring = useSessionStore(state => state.restoring)
   const { key: locationKey } = useLocation()
   const profileRoute = useMatch('/profile')
   const profile = useCurrentUser()
-  const { logout, logoutLocally, isLoggingOut, logoutUnconfirmed } = useLogout()
+  const { logout, logoutLocally, isLoggingOut, logoutFailure } = useLogout()
+
+  if (restoring) {
+    if (profile.isError || profile.isPaused) {
+      return <button type="button" onClick={() => void profile.refetch()} disabled={profile.isFetching} className={`min-h-11 rounded-lg px-2 hover:text-violet-100 ${focusClass}`}>Reintentar la comprobación de sesión</button>
+    }
+    return <span role="status" className="text-xs text-slate-300">Comprobando sesión…</span>
+  }
 
   if (sessionId === undefined) {
     return (
@@ -93,14 +105,12 @@ export function SessionControls() {
   return (
     <>
       {profile.isError && !profileRoute && <span role="status" className="min-w-0 text-xs text-slate-300">No pudimos actualizar el perfil.</span>}
-      <AccountMenu key={`${sessionId}:${locationKey}`} profile={profile.data} profileRoute={Boolean(profileRoute)} isLoggingOut={isLoggingOut} onLogout={() => void logout()} />
-      {logoutUnconfirmed && (
-        <div className="flex min-w-0 basis-full flex-wrap items-center justify-end gap-x-3 gap-y-1 rounded-lg border border-rose-300/20 bg-rose-950/25 px-3 py-2">
-          <ErrorMessage className="text-xs text-rose-200">No pudimos confirmar el cierre en todos los dispositivos.</ErrorMessage>
-          <button type="button" className={`min-h-11 rounded-lg px-2 text-sm font-medium text-violet-100 hover:bg-violet-400/15 disabled:opacity-60 ${focusClass}`} disabled={isLoggingOut} onClick={logoutLocally}>
-            Cerrar sesión solo en esta pestaña
-          </button>
-        </div>
+      <AccountMenu key={`${sessionId}:${locationKey}`} profile={profile.data} profileRoute={Boolean(profileRoute)} isLoggingOut={isLoggingOut}
+        onLogout={() => void logout()} onLocalLogout={() => void logoutLocally()} />
+      {logoutFailure && (
+        <ErrorMessage className="min-w-0 basis-full rounded-lg border border-rose-300/20 bg-rose-950/25 px-3 py-2 text-xs text-rose-200">
+          {logoutFailure.local ? 'No pudimos confirmar el cierre en este navegador.' : 'No pudimos confirmar el cierre en todos los dispositivos.'}
+        </ErrorMessage>
       )}
     </>
   )

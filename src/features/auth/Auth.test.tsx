@@ -15,7 +15,7 @@ import { useSessionStore } from './sessionStore'
 import type { LoginResult } from './types'
 
 const user = { id: '1', username: 'neko', email: 'neko@example.com', role: 'user' } as const
-const token = 'header.payload.signature'
+const sessionId = 'credential-test'
 const adapter = vi.fn<AxiosAdapter>()
 const originalAdapter = api.defaults.adapter
 
@@ -63,7 +63,7 @@ function fillCredentials(password = 'contraseña123') {
 beforeEach(() => {
   adapter.mockReset()
   api.defaults.adapter = adapter
-  useSessionStore.setState({ session: null, logoutSessionId: null })
+  useSessionStore.setState({ session: null, restoring: false, logoutSessionId: null })
 })
 
 afterEach(() => {
@@ -77,7 +77,7 @@ describe('Formularios de autenticación', () => {
     const pending = deferred<void>()
     adapter.mockImplementation(async config => {
       await pending.promise
-      return response(config, { success: true, data: { user, token } })
+      return response(config, { success: true, data: { user, sessionId } })
     })
     renderAuthPage('/login')
     fillCredentials()
@@ -103,7 +103,7 @@ describe('Formularios de autenticación', () => {
     pending.resolve()
     expect(await screen.findByRole('heading', { name: 'Catálogo' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Iniciar sesión' })).toBeNull()
-    expect(useSessionStore.getState().session?.token).toBe(token)
+    expect(useSessionStore.getState().session?.credentialId).toBe(sessionId)
   })
 
   it('registra una cuenta y reemplaza la ruta con el aviso de confirmación en login', async () => {
@@ -164,7 +164,7 @@ describe('Formularios de autenticación', () => {
     vi.spyOn(loginSchema, 'safeParse').mockImplementationOnce(() => {
       throw new Error('Fallo de validación simulado')
     })
-    adapter.mockImplementation(async config => response(config, { success: true, data: { user, token } }))
+    adapter.mockImplementation(async config => response(config, { success: true, data: { user, sessionId } }))
     renderAuthPage('/login')
     fillCredentials()
 
@@ -185,9 +185,9 @@ describe('Formularios de autenticación', () => {
   })
 
   it('conserva el token y omite el error de autenticación si falla onSuccess', async () => {
-    vi.spyOn(authApi, 'loginUser').mockResolvedValue({ user, token })
+    vi.spyOn(authApi, 'loginUser').mockResolvedValue({ user, sessionId })
     const onSuccess = vi.fn(() => {
-      expect(useSessionStore.getState().session?.token).toBe(token)
+      expect(useSessionStore.getState().session?.credentialId).toBe(sessionId)
       throw new Error('Fallo en el efecto de éxito')
     })
     const onError = vi.fn()
@@ -202,11 +202,11 @@ describe('Formularios de autenticación', () => {
     expect(onSuccess).toHaveBeenCalledTimes(1)
     expect(onError).not.toHaveBeenCalled()
     expect(onUnexpectedError).toHaveBeenCalledTimes(1)
-    expect(useSessionStore.getState().session?.token).toBe(token)
+    expect(useSessionStore.getState().session?.credentialId).toBe(sessionId)
   })
 
   it.each([
-    { path: '/login', button: 'Iniciar sesión', data: { user, token } },
+    { path: '/login', button: 'Iniciar sesión', data: { user, sessionId } },
     { path: '/register', button: 'Crear cuenta', data: user },
   ] as const)('aborta el envío al salir de $path e ignora su respuesta tardía', async ({ path, button, data }) => {
     const pending = deferred<void>()
@@ -224,7 +224,8 @@ describe('Formularios de autenticación', () => {
     const signal = adapter.mock.calls[0][0].signal
     fireEvent.click(screen.getByRole('link', { name: 'Volver al catálogo' }))
 
-    expect(signal?.aborted).toBe(true)
+    if (path === '/register') expect(signal?.aborted).toBe(true)
+    else expect(signal).toBeUndefined()
     await act(async () => pending.resolve())
     expect(screen.getByRole('heading', { name: 'Catálogo' })).toBeTruthy()
     expect(screen.queryByRole('alert')).toBeNull()
@@ -235,7 +236,7 @@ describe('Formularios de autenticación', () => {
     const olderLogin = deferred<LoginResult>()
     const login = vi.spyOn(authApi, 'loginUser')
       .mockImplementationOnce(() => olderLogin.promise)
-      .mockResolvedValueOnce({ user, token })
+      .mockResolvedValueOnce({ user, sessionId })
     const first = renderAuthPage('/login')
     fillCredentials()
     fireEvent.click(screen.getByRole('button', { name: 'Iniciar sesión' }))
@@ -247,10 +248,12 @@ describe('Formularios de autenticación', () => {
     fireEvent.change(email, { target: { value: user.email } })
     fireEvent.change(password, { target: { value: 'contraseña123' } })
     fireEvent.submit(password.closest('form')!)
-    await screen.findByRole('heading', { name: 'Catálogo' })
+    expect(login).toHaveBeenCalledTimes(1)
 
-    await act(async () => olderLogin.resolve({ user, token: 'older.payload.signature' }))
-    expect(useSessionStore.getState().session?.token).toBe(token)
+    await act(async () => olderLogin.resolve({ user, sessionId: 'older-credential' }))
+    await screen.findByRole('heading', { name: 'Catálogo' })
+    expect(login).toHaveBeenCalledTimes(2)
+    expect(useSessionStore.getState().session?.credentialId).toBe(sessionId)
     expect(first.container.querySelector('form')?.getAttribute('aria-busy')).toBe('false')
   })
 })

@@ -17,6 +17,7 @@ const user = { id: '507f1f77bcf86cd799439011', username: 'neko', email: 'neko@ex
 const profile = { ...user, avatarUrl: '', createdAt: '2026-01-01T00:00:00.000Z' }
 const profileResponse = {
   success: true,
+  sessionId: token,
   data: { _id: user.id, username: user.username, email: user.email, role: user.role, createdAt: profile.createdAt },
 }
 const logoutResponse = { success: true, message: 'Sesión cerrada correctamente' }
@@ -27,13 +28,14 @@ let queryClient: QueryClient
 
 type RequestHandler = (config: InternalAxiosRequestConfig) => unknown
 
-function mockRequests({ me, login, logout }: { me?: RequestHandler; login?: RequestHandler; logout?: RequestHandler } = {}) {
+function mockRequests({ me, login, logout, local }: { me?: RequestHandler; login?: RequestHandler; logout?: RequestHandler; local?: RequestHandler } = {}) {
   adapter.mockImplementation(async config => {
     let data: unknown
     switch (config.url) {
       case '/auth/me': data = me ? await me(config) : profileResponse; break
-      case '/auth/login': data = login ? await login(config) : { success: true, data: { user, token } }; break
+      case '/auth/login': data = login ? await login(config) : { success: true, data: { user, sessionId: token } }; break
       case '/auth/logout': data = logout ? await logout(config) : logoutResponse; break
+      case '/auth/logout/local': return { config, data: await local?.(config), status: 204, statusText: 'OK', headers: {} }
       default: throw new Error(`Solicitud inesperada: ${config.url}`)
     }
     return { config, data, status: 200, statusText: 'OK', headers: {} }
@@ -82,7 +84,7 @@ function profileKey(sessionId: number) {
 beforeEach(() => {
   adapter.mockReset()
   api.defaults.adapter = adapter
-  useSessionStore.setState({ session: null, logoutSessionId: null })
+  useSessionStore.setState({ session: null, restoring: false, logoutSessionId: null })
   queryClient = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } })
   queryClient.setQueryData(publicKey, ['anime público'])
 })
@@ -96,7 +98,7 @@ afterEach(() => {
 })
 
 describe('Perfil de la sesión', () => {
-  it('consulta /me solo después de iniciar sesión y guarda el perfil normalizado en React Query', async () => {
+  it('consulta /me tras iniciar sesión y guarda el perfil normalizado en React Query', async () => {
     mockRequests()
     renderSession(true)
     expect(adapter).not.toHaveBeenCalled()
@@ -104,11 +106,12 @@ describe('Perfil de la sesión', () => {
 
     expect(await screen.findByText('Inicio de sesión correcto')).toBeTruthy()
     const session = useSessionStore.getState().session!
-    expect(session).toEqual({ id: expect.any(Number), token })
+    expect(session).toEqual({ id: expect.any(Number), credentialId: token })
     await waitFor(() => expect(queryClient.getQueryData(profileKey(session.id))).toEqual(profile))
     const request = adapter.mock.calls.find(([config]) => config.url === '/auth/me')?.[0]
     expect(request?.method).toBe('get')
-    expect(request?.headers.get('Authorization')).toBe(`Bearer ${token}`)
+    expect(request?.headers.has('Authorization')).toBe(false)
+    expect(request?.withCredentials).toBe(true)
     expect(queryClient.getQueryCache().getAll().map(query => query.queryHash).join()).not.toContain(token)
   })
 
@@ -163,20 +166,20 @@ describe('Perfil de la sesión', () => {
       .mockImplementationOnce(async () => {
         await pendingProfile.promise
         if (result === '401') throw new authApi.AuthRequestError('Sesión inválida', { status: 401 })
-        return { ...profile, username: 'Perfil anterior' }
+        return { sessionId: token, profile: { ...profile, username: 'Perfil anterior' } }
       })
-      .mockResolvedValueOnce({ ...profile, username: 'Perfil nuevo' })
+      .mockResolvedValueOnce({ sessionId: token, profile: { ...profile, username: 'Perfil nuevo' } })
     queryClient.setQueryData([...privateSessionKey(first.id), 'private-data'], 'anterior')
     mockRequests()
     renderSession(true)
     await waitFor(() => expect(getProfile).toHaveBeenCalledTimes(1))
-    const signal = getProfile.mock.calls[0][1]
+    const signal = getProfile.mock.calls[0][0]
     submitLogin()
 
     expect(await screen.findByText('Inicio de sesión correcto')).toBeTruthy()
     const second = useSessionStore.getState().session!
     expect(second.id).not.toBe(first.id)
-    expect(second.token).toBe(first.token)
+    expect(second.credentialId).toBe(first.credentialId)
     expect(signal.aborted).toBe(true)
     await waitFor(() => expect(queryClient.getQueryData(profileKey(second.id))).toMatchObject({ username: 'Perfil nuevo' }))
     await act(async () => pendingProfile.resolve())
@@ -189,6 +192,34 @@ describe('Perfil de la sesión', () => {
 })
 
 describe('Cierre de sesión', () => {
+  it('se resincroniza si el navegador sustituyó la cookie antes de cerrar sesión', async () => {
+    const old = useSessionStore.getState().startSession(token)
+    let current = token
+    mockRequests({
+      me: () => ({ ...profileResponse, sessionId: current }),
+      logout: config => {
+        current = nextToken
+        const response = { config, status: 409, data: { code: 'SESSION_CHANGED' }, headers: {}, statusText: '' }
+        throw new AxiosError('Conflicto', undefined, config, undefined, response)
+      },
+    })
+    renderSession()
+    await waitFor(() => expect(queryClient.getQueryData(profileKey(old.id))).toEqual(profile))
+    fireEvent.click(logoutButton())
+    await waitFor(() => expect(useSessionStore.getState().session?.credentialId).toBe(nextToken))
+    expect(queryClient.getQueryData(profileKey(old.id))).toBeUndefined()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('no informa que cerró la sesión si el cierre en este navegador falla', async () => {
+    const session = useSessionStore.getState().startSession(token)
+    mockRequests({ local: config => rejectRequest(config, 503) })
+    renderSession()
+    logoutButton()
+    fireEvent.click(screen.getByRole('button', { name: 'Cerrar sesión en este navegador' }))
+    expect((await screen.findByRole('alert')).textContent).toBe('No pudimos confirmar el cierre en este navegador.')
+    expect(useSessionStore.getState().session).toEqual(session)
+  })
   it.each([200, 401])('cierra la sesión vigente y elimina la caché privada con HTTP %s', async status => {
     mockRequests({ logout: config => status === 401 ? rejectRequest(config, status) : logoutResponse })
     renderSession(true)
@@ -206,7 +237,8 @@ describe('Cierre de sesión', () => {
     await waitFor(() => expect(useSessionStore.getState().session).toBeNull())
     const request = adapter.mock.calls.find(([config]) => config.url === '/auth/logout')?.[0]
     expect(request?.method).toBe('post')
-    expect(request?.headers.get('Authorization')).toBe(`Bearer ${token}`)
+    expect(request?.headers.get('X-Neko-Session')).toBe(token)
+    expect(request?.headers.get('X-Neko-CSRF')).toBe('1')
     expect(queryClient.getQueriesData({ queryKey: privateSessionKey(session.id) })).toEqual([])
     expect(queryClient.getQueryData(publicKey)).toEqual(['anime público'])
     expect(screen.queryByText('Inicio de sesión correcto')).toBeNull()
@@ -215,7 +247,7 @@ describe('Cierre de sesión', () => {
     expect(screen.getByRole('button', { name: 'Iniciar sesión' })).toBeTruthy()
   })
 
-  it.each([undefined, 503, 200])('informa del cierre sin confirmar (%s) y permite cerrar solo en la pestaña', async status => {
+  it.each([undefined, 503, 200])('informa del cierre sin confirmar (%s) y permite cerrar en el navegador', async status => {
     const session = useSessionStore.getState().startSession(token)
     const logout = vi.fn<RequestHandler>(config => status === 200 ? { success: true } : rejectRequest(config, status))
     mockRequests({ logout })
@@ -227,10 +259,11 @@ describe('Cierre de sesión', () => {
     expect(alert.textContent).toBe('No pudimos confirmar el cierre en todos los dispositivos.')
     expect(useSessionStore.getState().session).toEqual(session)
     expect(queryClient.getQueryData(profileKey(session.id))).toEqual(profile)
-    fireEvent.click(screen.getByRole('button', { name: 'Cerrar sesión solo en esta pestaña' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cerrar sesión en este navegador' }))
 
-    expect(useSessionStore.getState().session).toBeNull()
+    await waitFor(() => expect(useSessionStore.getState().session).toBeNull())
     expect(logout).toHaveBeenCalledTimes(1)
+    expect(adapter.mock.calls.some(([request]) => request.url === '/auth/logout/local')).toBe(true)
     expect(queryClient.getQueriesData({ queryKey: privateSessionKey(session.id) })).toEqual([])
     expect(queryClient.getQueryData(publicKey)).toEqual(['anime público'])
   })
@@ -259,19 +292,19 @@ describe('Cierre de sesión', () => {
     useSessionStore.getState().startSession(token)
     const login = vi.spyOn(authApi, 'loginUser').mockImplementationOnce(async () => {
       await pendingLogin.promise
-      return { user, token: nextToken }
+      throw new authApi.AuthRequestError('Credenciales incorrectas', { status: 401 })
     })
     mockRequests({ logout: config => rejectRequest(config, 503) })
     renderSession(true)
     fireEvent.click(logoutButton())
-    const localLogout = await screen.findByRole('button', { name: 'Cerrar sesión solo en esta pestaña' })
+    const localLogout = await screen.findByRole('button', { name: 'Cerrar sesión en este navegador' })
     submitLogin()
     await waitFor(() => expect(login).toHaveBeenCalledTimes(1))
 
     fireEvent.click(localLogout)
-    expect(login.mock.calls[0][1]?.aborted).toBe(true)
+    expect(adapter.mock.calls.some(([request]) => request.url === '/auth/logout/local')).toBe(false)
     await act(async () => pendingLogin.resolve())
-    expect(useSessionStore.getState().session).toBeNull()
+    await waitFor(() => expect(useSessionStore.getState().session).toBeNull())
     expect(screen.queryByText('Inicio de sesión correcto')).toBeNull()
   })
 
@@ -281,21 +314,20 @@ describe('Cierre de sesión', () => {
     const session = useSessionStore.getState().startSession(token)
     const login = vi.spyOn(authApi, 'loginUser').mockImplementationOnce(async () => {
       await pendingLogin.promise
-      return { user, token: nextToken }
+      throw new authApi.AuthRequestError('Credenciales incorrectas', { status: 401 })
     })
     const logout = vi.fn(async () => { await pendingLogout.promise; return logoutResponse })
     mockRequests({ logout })
     renderSession(true)
     submitLogin()
     await waitFor(() => expect(login).toHaveBeenCalledTimes(1))
-    const signal = login.mock.calls[0][1]
     const button = logoutButton()
     act(() => { fireEvent.click(button); fireEvent.click(button) })
 
-    expect(signal?.aborted).toBe(true)
     expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Cerrando sesión…' }).disabled).toBe(true)
-    expect(logout).toHaveBeenCalledTimes(1)
+    expect(logout).not.toHaveBeenCalled()
     await act(async () => pendingLogin.resolve())
+    await waitFor(() => expect(logout).toHaveBeenCalledTimes(1))
     const loginButton = screen.getByRole<HTMLButtonElement>('button', { name: 'Iniciar sesión' })
     expect(loginButton.disabled).toBe(true)
     await act(async () => { fireEvent.submit(loginButton.form!) })
@@ -315,9 +347,10 @@ describe('Cierre de sesión', () => {
       await pendingLogout.promise
       return status === 200 ? logoutResponse : rejectRequest(config, status)
     })
-    mockRequests({ logout })
+    mockRequests({ logout, me: () => ({ ...profileResponse, sessionId: useSessionStore.getState().session?.credentialId ?? token }) })
     renderSession()
     fireEvent.click(logoutButton())
+    await waitFor(() => expect(logout).toHaveBeenCalledTimes(1))
     const second = await act(async () => useSessionStore.getState().startSession(nextToken))
     await waitFor(() => expect(queryClient.getQueryData(profileKey(second.id))).toEqual(profile))
     await act(async () => pendingLogout.resolve())

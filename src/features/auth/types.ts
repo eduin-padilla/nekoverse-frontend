@@ -16,6 +16,6 @@ export type AuthField = 'username' | 'email' | 'password' | 'currentPassword' | 
 export type AuthFieldErrors = Partial<Record<AuthField, string>>
 
 export interface LoginResult {
-  token: string
+  sessionId: string
   user: AuthUser
 }

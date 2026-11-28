@@ -12,11 +12,12 @@ const userSchema = z.object({
 })
 const loginResponseSchema = z.object({
   success: z.literal(true),
-  data: z.object({ token: z.string().regex(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/), user: userSchema }),
+  data: z.object({ sessionId: z.string().min(1), user: userSchema }),
 })
 const registerResponseSchema = z.object({ success: z.literal(true), data: userSchema })
 const profileResponseSchema = z.object({
   success: z.literal(true),
+  sessionId: z.string().min(1),
   data: userSchema.omit({ id: true }).extend({
     _id: userSchema.shape.id,
     avatarUrl: z.string().nullish(),
@@ -40,6 +41,7 @@ interface AuthErrorDetails {
   cancelled?: boolean
   status?: number
   networkError?: boolean
+  sessionChanged?: boolean
 }
 
 export class AuthRequestError extends Error {
@@ -61,6 +63,9 @@ function toAuthError(error: unknown, operation: 'login' | 'register' | 'session'
   }
 
   const { status, data } = error.response
+  if (status === 409 && data && typeof data === 'object' && 'code' in data && data.code === 'SESSION_CHANGED') {
+    return new AuthRequestError('La sesión cambió en el navegador.', { status, sessionChanged: true })
+  }
   if (status === 401) {
     const message = operation === 'login' ? 'Correo o contraseña incorrectos.' : 'Tu sesión ya no está activa.'
     return new AuthRequestError(message, { status })
@@ -85,9 +90,13 @@ function toAuthError(error: unknown, operation: 'login' | 'register' | 'session'
   return new AuthRequestError('El servidor no pudo completar la solicitud. Inténtalo de nuevo más tarde.', { status })
 }
 
-export async function loginUser(input: LoginInput, signal?: AbortSignal): Promise<LoginResult> {
+function writeHeaders(credentialId?: string) {
+  return credentialId ? { 'X-Neko-CSRF': '1', 'X-Neko-Session': credentialId } : { 'X-Neko-CSRF': '1' }
+}
+
+export async function loginUser(input: LoginInput): Promise<LoginResult> {
   try {
-    const response = await api.post<unknown>('/auth/login', input, { signal })
+    const response = await api.post<unknown>('/auth/login', input, { headers: writeHeaders() })
     const result = loginResponseSchema.safeParse(response.data)
     if (!result.success) throw new AuthRequestError('El servidor devolvió una respuesta de acceso incompleta o no válida.')
     return result.data.data
@@ -98,7 +107,7 @@ export async function loginUser(input: LoginInput, signal?: AbortSignal): Promis
 
 export async function registerUser(input: RegisterInput, signal?: AbortSignal): Promise<AuthUser> {
   try {
-    const response = await api.post<unknown>('/auth/register', input, { signal })
+    const response = await api.post<unknown>('/auth/register', input, { signal, headers: writeHeaders() })
     const result = registerResponseSchema.safeParse(response.data)
     if (!result.success) throw new AuthRequestError('No pudimos confirmar el registro: la respuesta del servidor está incompleta.')
     return result.data.data
@@ -107,22 +116,23 @@ export async function registerUser(input: RegisterInput, signal?: AbortSignal): 
   }
 }
 
-export async function getUserProfile(token: string, signal: AbortSignal): Promise<UserProfile> {
+export async function getUserProfile(signal: AbortSignal): Promise<{ sessionId: string; profile: UserProfile }> {
   try {
-    const response = await api.get<unknown>('/auth/me', { signal, headers: { Authorization: `Bearer ${token}` } })
+    const response = await api.get<unknown>('/auth/me', { signal })
     const result = profileResponseSchema.safeParse(response.data)
     if (!result.success) throw new AuthRequestError('El servidor devolvió un perfil incompleto o no válido.')
     const { _id, avatarUrl, ...profile } = result.data.data
-    return { id: _id, avatarUrl: avatarUrl ?? '', ...profile }
+    return { sessionId: result.data.sessionId, profile: { id: _id, avatarUrl: avatarUrl ?? '', ...profile } }
   } catch (error) {
     throw toAuthError(error, 'session')
   }
 }
 
-export async function logoutUser(token: string): Promise<void> {
+export async function logoutUser(credentialId: string, local = false): Promise<void> {
   try {
-    const response = await api.post<unknown>('/auth/logout', undefined, { headers: { Authorization: `Bearer ${token}` } })
-    if (!messageResponseSchema.safeParse(response.data).success) {
+    const response = await api.post<unknown>(local ? '/auth/logout/local' : '/auth/logout', undefined, { headers: writeHeaders(credentialId) })
+    const confirmed = local ? response.status === 204 : messageResponseSchema.safeParse(response.data).success
+    if (!confirmed) {
       throw new AuthRequestError('El servidor devolvió una confirmación de cierre no válida.')
     }
   } catch (error) {
@@ -130,9 +140,9 @@ export async function logoutUser(token: string): Promise<void> {
   }
 }
 
-export async function updateUserProfile(token: string, input: UpdateProfileInput, signal: AbortSignal): Promise<Omit<UserProfile, 'createdAt'>> {
+export async function updateUserProfile(credentialId: string, input: UpdateProfileInput, signal: AbortSignal): Promise<Omit<UserProfile, 'createdAt'>> {
   try {
-    const response = await api.patch<unknown>('/auth/me', input, { signal, headers: { Authorization: `Bearer ${token}` } })
+    const response = await api.patch<unknown>('/auth/me', input, { signal, headers: writeHeaders(credentialId) })
     const result = updateProfileResponseSchema.safeParse(response.data)
     if (!result.success) throw new AuthRequestError('No pudimos confirmar la actualización del perfil.')
     const { avatarUrl, ...profile } = result.data.data
@@ -142,9 +152,9 @@ export async function updateUserProfile(token: string, input: UpdateProfileInput
   }
 }
 
-export async function changeUserPassword(token: string, input: ChangePasswordInput, signal: AbortSignal): Promise<void> {
+export async function changeUserPassword(credentialId: string, input: ChangePasswordInput): Promise<void> {
   try {
-    const response = await api.patch<unknown>('/auth/change-password', input, { signal, headers: { Authorization: `Bearer ${token}` } })
+    const response = await api.patch<unknown>('/auth/change-password', input, { headers: writeHeaders(credentialId) })
     if (!messageResponseSchema.safeParse(response.data).success) {
       throw new AuthRequestError('No pudimos confirmar el cambio de contraseña.')
     }

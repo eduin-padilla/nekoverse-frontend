@@ -13,3 +13,9 @@ export function removePrivateQueries(queryClient: QueryClient, sessionId: number
 export function endSession(queryClient: QueryClient, sessionId: number) {
   if (useSessionStore.getState().clearSession(sessionId)) removePrivateQueries(queryClient, sessionId)
 }
+
+export function recheckSession(queryClient: QueryClient) {
+  const { generation, restoreSession } = useSessionStore.getState()
+  restoreSession()
+  removePrivateQueries(queryClient, generation)
+}

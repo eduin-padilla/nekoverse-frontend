@@ -15,10 +15,11 @@ export interface AuthOutletContext {
 
 export function RequireAuth() {
   const sessionId = useSessionStore(state => state.session?.id)
+  const restoring = useSessionStore(state => state.restoring)
   const location = useLocation()
   const profile = useCurrentUser({ refetchOnMount: false })
 
-  if (sessionId === undefined) {
+  if (!restoring && sessionId === undefined) {
     const { pathname, search, hash } = location
     return <Navigate to="/login" replace state={{ returnTo: { pathname, search, hash } }} />
   }
@@ -38,7 +39,7 @@ export function RequireAuth() {
     </div>
   )
 
-  if (!profile.data) {
+  if (sessionId === undefined || !profile.data) {
     return (
       <ProfileLayout>
         {feedback || (

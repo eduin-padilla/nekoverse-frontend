@@ -15,7 +15,7 @@ const token = 'profile.payload.signature'
 const user = { id: '507f1f77bcf86cd799439011', username: 'neko', email: 'neko@example.com', role: 'user' } as const
 const createdAt = '2026-01-11T12:00:00.000Z'
 const { id, ...profileFields } = user
-const profileResponse = { success: true, data: { _id: id, ...profileFields, createdAt } }
+const profileResponse = { success: true, sessionId: token, data: { _id: id, ...profileFields, createdAt } }
 const adapter = vi.fn<AxiosAdapter>()
 const originalAdapter = api.defaults.adapter
 let queryClient: QueryClient
@@ -32,7 +32,7 @@ function mockApi(getProfile: HandleRequest = () => profileResponse, writes?: { p
         data = config.method === 'patch' ? await (writes?.profile ?? (() => profileUpdateResponse))(config) : await getProfile(config)
         break
       case '/auth/change-password': data = await (writes?.password ?? (() => passwordResponse))(config); break
-      case '/auth/login': data = { success: true, data: { user, token } }; break
+      case '/auth/login': data = { success: true, data: { user, sessionId: token } }; break
       case '/auth/logout': data = { success: true, message: 'Sesión cerrada correctamente' }; break
       case '/animes': data = { success: true, data: [], pagination: { total: 0, page: 1, totalPages: 1 } }; break
       case '/animes/neko': data = { success: true, data: { title: 'Anime de prueba', slug: 'neko' } }; break
@@ -81,7 +81,7 @@ function expectLocation(path: string) {
 }
 
 beforeEach(() => {
-  useSessionStore.setState({ session: null, logoutSessionId: null })
+  useSessionStore.setState({ session: null, restoring: false, logoutSessionId: null })
   queryClient = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } })
   adapter.mockReset()
   api.defaults.adapter = adapter
@@ -109,7 +109,8 @@ describe('Ruta privada del perfil', () => {
     expectLocation('/profile?origen=catalogo#datos')
     const requests = adapter.mock.calls.filter(([config]) => config.url === '/auth/me')
     expect(requests).toHaveLength(1)
-    expect(requests[0][0].headers.get('Authorization')).toBe(`Bearer ${token}`)
+    expect(requests[0][0].headers.has('Authorization')).toBe(false)
+    expect(requests[0][0].withCredentials).toBe(true)
     expect(screen.getByText(user.email)).toBeTruthy()
     expect(screen.getByText('11 de enero de 2026').getAttribute('datetime')).toBe(createdAt)
     expect(within(screen.getByRole('main')).getByText('N').getAttribute('aria-hidden')).toBe('true')
@@ -227,7 +228,7 @@ describe('Ruta privada del perfil', () => {
     expectLocation('/login')
   })
 
-  it('pide iniciar sesión al recargar /profile con un nuevo cliente y el almacén vacío', async () => {
+  it('restaura /profile al recargar con un nuevo cliente y el almacén vacío', async () => {
     mockApi()
     useSessionStore.getState().startSession(token)
     const firstRender = renderApp('/profile')
@@ -236,13 +237,46 @@ describe('Ruta privada del perfil', () => {
     firstRender.unmount()
     queryClient.clear()
     queryClient = new QueryClient()
-    useSessionStore.setState({ session: null })
+    useSessionStore.getState().restoreSession()
     adapter.mockClear()
     renderApp('/profile')
 
+    expect(await screen.findByText(user.email)).toBeTruthy()
+    expectLocation('/profile')
+    expect(adapter).toHaveBeenCalledTimes(1)
+  })
+
+  it('espera antes de redirigir si la comprobación inicial termina con un 401', async () => {
+    const answer = deferred()
+    mockApi(async config => {
+      await answer.pending
+      rejectRequest(config, 401)
+    })
+    useSessionStore.getState().restoreSession()
+    renderApp('/profile')
+    expect(await screen.findByText('Cargando perfil…')).toBeTruthy()
+    expectLocation('/profile')
+    expect(screen.queryByRole('link', { name: 'Iniciar sesión' })).toBeNull()
+
+    await act(async () => answer.finish())
     expect(await screen.findByRole('heading', { name: 'Bienvenido de nuevo' })).toBeTruthy()
     expectLocation('/login')
-    expect(adapter).not.toHaveBeenCalled()
+    expect(adapter).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([undefined, 503])('mantiene /profile y permite restaurar tras un fallo inicial (%s)', async status => {
+    let available = false
+    mockApi(config => available ? profileResponse : rejectRequest(config, status))
+    useSessionStore.getState().restoreSession()
+    renderApp('/profile')
+    expect(await screen.findByText('No pudimos cargar el perfil.')).toBeTruthy()
+    expect(useSessionStore.getState().restoring).toBe(true)
+    expectLocation('/profile')
+
+    available = true
+    fireEvent.click(screen.getByRole('button', { name: 'Reintentar' }))
+    expect(await screen.findByText(user.email)).toBeTruthy()
+    expect(useSessionStore.getState().restoring).toBe(false)
   })
 
   it.each([['/', 'Catálogo de anime'], ['/animes/neko', 'Anime de prueba']])('mantiene pública la ruta %s', async (path, heading) => {
@@ -384,7 +418,8 @@ describe('Edición del perfil', () => {
     await waitFor(() => expect(patch).toHaveBeenCalledTimes(1))
     const request = adapter.mock.calls.find(([config]) => config.method === 'patch')?.[0]
     expect(request?.data).toBe(JSON.stringify({ username: 'neko_nuevo' }))
-    expect(request?.headers.get('Authorization')).toBe(`Bearer ${token}`)
+    expect(request?.headers.get('X-Neko-Session')).toBe(token)
+    expect(request?.headers.get('X-Neko-CSRF')).toBe('1')
     await act(async () => update.finish())
 
     expect(await form.findByText('Perfil actualizado correctamente.')).toBeTruthy()
@@ -518,7 +553,7 @@ describe('Cambio de contraseña', () => {
 
     expect(await screen.findByRole('heading', { name: 'Bienvenido de nuevo' })).toBeTruthy()
     const request = adapter.mock.calls.find(([config]) => config.url === '/auth/change-password')?.[0]
-    expect(request?.headers.get('Authorization')).toBe(`Bearer ${token}`)
+    expect(request?.headers.get('X-Neko-Session')).toBe(token)
     expect(JSON.parse(request?.data)).toEqual({ currentPassword: 'contraseña-actual', newPassword: nextPassword })
     expect(useSessionStore.getState().session).toBeNull()
     expect(queryClient.getQueryData(profileQueryKey(session.id))).toBeUndefined()
