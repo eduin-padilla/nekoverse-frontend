@@ -545,6 +545,24 @@ describe('Cambio de contraseña', () => {
     expectLocation('/profile')
   })
 
+  it.each([
+    { status: 429, code: 'AUTH_RATE_LIMITED', seconds: '60', message: 'Demasiados intentos. Vuelve a intentarlo en 1 minuto.' },
+    { status: 503, code: 'AUTH_BUSY', seconds: '2', message: 'El servicio de autenticación está ocupado. Vuelve a intentarlo en 2 segundos.' },
+  ])('conserva la sesión y muestra $code al cambiar la contraseña', async ({ status, code, seconds, message }) => {
+    const password = vi.fn((config: InternalAxiosRequestConfig) => {
+      const response = { config, status, data: { success: false, code }, headers: { 'retry-after': seconds }, statusText: '' }
+      throw new AxiosError('Error HTTP', undefined, config, undefined, response)
+    })
+    mockApi(undefined, { password })
+    const session = await showProfile()
+    const form = submitPassword()
+
+    expect((await form.findByRole('alert')).textContent).toBe(message)
+    expect(password).toHaveBeenCalledTimes(1)
+    expect(useSessionStore.getState().session).toEqual(session)
+    expectLocation('/profile')
+  })
+
   it('envía solo las dos contraseñas y vuelve al login al confirmar el cambio', async () => {
     mockApi()
     const session = await showProfile()

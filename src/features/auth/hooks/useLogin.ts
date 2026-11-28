@@ -26,7 +26,8 @@ export function useLogin() {
           try {
             ({ sessionId } = await loginUser(input))
           } catch (error) {
-            if (error instanceof AuthRequestError && (error.details.status === undefined || error.details.status >= 500)) {
+            if (error instanceof AuthRequestError && error.details.code !== 'AUTH_BUSY' &&
+                (error.details.status === undefined || error.details.status >= 500)) {
               const { session } = useSessionStore.getState()
               if (session) void queryClient.invalidateQueries({ queryKey: profileQueryKey(session.id) })
               else recheckSession(queryClient)

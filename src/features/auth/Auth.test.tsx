@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react'
-import { AxiosError, type AxiosAdapter, type InternalAxiosRequestConfig } from 'axios'
+import { AxiosError, AxiosHeaders, type AxiosAdapter, type InternalAxiosRequestConfig } from 'axios'
 import type { ReactNode } from 'react'
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -158,6 +158,33 @@ describe('Formularios de autenticación', () => {
     expect(screen.getByLabelText<HTMLInputElement>('Contraseña').value).toBe('')
     expect(screen.getByLabelText<HTMLInputElement>('Correo electrónico').value.trim()).toBe('NEKO@EXAMPLE.COM')
     expect(useSessionStore.getState().session).toBeNull()
+  })
+
+  it.each([
+    { path: '/login', button: 'Iniciar sesión', status: 429, code: 'AUTH_RATE_LIMITED', retryAfter: '125',
+      message: 'Demasiados intentos. Vuelve a intentarlo en unos 3 minutos.' },
+    { path: '/register', button: 'Crear cuenta', status: 429, code: 'AUTH_RATE_LIMITED', retryAfter: undefined,
+      message: 'Demasiados intentos. Espera un momento antes de volver a intentarlo.' },
+    { path: '/register', button: 'Crear cuenta', status: 429, code: 'AUTH_RATE_LIMITED', retryAfter: '-1',
+      message: 'Demasiados intentos. Espera un momento antes de volver a intentarlo.' },
+    { path: '/login', button: 'Iniciar sesión', status: 503, code: 'AUTH_BUSY', retryAfter: '2',
+      message: 'El servicio de autenticación está ocupado. Vuelve a intentarlo en 2 segundos.' },
+  ] as const)('muestra $code en $path sin reenviar la solicitud', async ({ path, button, status, code, retryAfter, message }) => {
+    const session = path === '/login' ? useSessionStore.getState().startSession('existing-session') : null
+    adapter.mockImplementation(async config => {
+      const headers = new AxiosHeaders()
+      if (retryAfter !== undefined) headers.set('Retry-After', retryAfter)
+      const failure = { ...response(config, { success: false, code }, status), headers }
+      throw new AxiosError('Error HTTP', undefined, config, undefined, failure)
+    })
+    renderAuthPage(path)
+    if (path === '/register') fireEvent.change(screen.getByLabelText('Nombre de usuario'), { target: { value: 'neko' } })
+    fillCredentials()
+    fireEvent.click(screen.getByRole('button', { name: button }))
+
+    expect((await screen.findByRole('alert')).textContent).toBe(message)
+    expect(adapter).toHaveBeenCalledTimes(1)
+    expect(useSessionStore.getState().session).toEqual(session)
   })
 
   it('informa de una excepción durante el envío y permite volver a intentarlo', async () => {

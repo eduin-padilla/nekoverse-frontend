@@ -42,6 +42,8 @@ interface AuthErrorDetails {
   status?: number
   networkError?: boolean
   sessionChanged?: boolean
+  code?: 'AUTH_RATE_LIMITED' | 'AUTH_BUSY'
+  retryAfterSeconds?: number
 }
 
 export class AuthRequestError extends Error {
@@ -54,6 +56,20 @@ export class AuthRequestError extends Error {
   }
 }
 
+function readRetryAfter(value: unknown) {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return undefined
+  const seconds = Number(value)
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : undefined
+}
+
+function retryMessage(seconds: number | undefined) {
+  if (seconds === undefined) return 'Espera un momento antes de volver a intentarlo.'
+  if (seconds === 1) return 'Vuelve a intentarlo en 1 segundo.'
+  if (seconds < 60) return `Vuelve a intentarlo en ${seconds} segundos.`
+  const minutes = Math.ceil(seconds / 60)
+  return minutes === 1 ? 'Vuelve a intentarlo en 1 minuto.' : `Vuelve a intentarlo en unos ${minutes} minutos.`
+}
+
 function toAuthError(error: unknown, operation: 'login' | 'register' | 'session' | 'updateProfile' | 'changePassword'): AuthRequestError {
   if (error instanceof AuthRequestError) return error
   if (axios.isCancel(error)) return new AuthRequestError('La solicitud fue cancelada', { cancelled: true })
@@ -63,7 +79,20 @@ function toAuthError(error: unknown, operation: 'login' | 'register' | 'session'
   }
 
   const { status, data } = error.response
-  if (status === 409 && data && typeof data === 'object' && 'code' in data && data.code === 'SESSION_CHANGED') {
+  const code = data && typeof data === 'object' && 'code' in data ? data.code : undefined
+  const busy = status === 503 && code === 'AUTH_BUSY'
+  if (status === 429 || busy) {
+    const { headers } = error.response
+    const retryAfter = headers instanceof axios.AxiosHeaders
+      ? headers.get('Retry-After')
+      : Object.entries(headers).find(([name]) => name.toLowerCase() === 'retry-after')?.[1]
+    const retryAfterSeconds = readRetryAfter(retryAfter)
+    const message = busy ? 'El servicio de autenticación está ocupado.' : 'Demasiados intentos.'
+    return new AuthRequestError(`${message} ${retryMessage(retryAfterSeconds)}`, {
+      status, code: busy ? 'AUTH_BUSY' : code === 'AUTH_RATE_LIMITED' ? code : undefined, retryAfterSeconds,
+    })
+  }
+  if (status === 409 && code === 'SESSION_CHANGED') {
     return new AuthRequestError('La sesión cambió en el navegador.', { status, sessionChanged: true })
   }
   if (status === 401) {
@@ -86,7 +115,6 @@ function toAuthError(error: unknown, operation: 'login' | 'register' | 'session'
     }
     return new AuthRequestError('Revisa los datos del formulario.', { status, fieldErrors })
   }
-  if (status === 429) return new AuthRequestError('Demasiados intentos. Espera un momento antes de volver a intentarlo.', { status })
   return new AuthRequestError('El servidor no pudo completar la solicitud. Inténtalo de nuevo más tarde.', { status })
 }
 
